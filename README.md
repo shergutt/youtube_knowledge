@@ -121,3 +121,102 @@ The Vite dev server proxies `/api` and `/health` to `http://localhost:8080` by d
 cd backend
 cargo test
 ```
+
+## Deploying backend changes
+
+The backend is deployed to a Linux VPS with `systemd` under a **symlink-rolled**
+pattern: each release is a distinct file, and `systemctl` runs through a
+`current` symlink. Updating the symlink + restarting is atomic; on a failed
+health check the previous binary is restored.
+
+### Layout on the VPS
+
+```text
+/opt/transcript-backend/
+├── src/                                  git clone of this repo
+│   └── backend/                          Rust crate (cargo build runs here)
+├── target/release/
+│   ├── transcript-backend-0.1.0+g976a7d9   ← built binary (one per release)
+│   ├── transcript-backend-0.1.1+abcd1234
+│   └── transcript-backend.current → /opt/transcript-backend/target/release/transcript-backend-0.1.0+g976a7d9
+└── deploy.sh                             symlink-rolled deploy script
+
+/etc/systemd/system/transcript-backend.service.d/override.conf
+   └─ ExecStart=/opt/transcript-backend/target/release/transcript-backend.current
+
+/var/lib/transcript-backend/
+├── cookies.txt                           yt-dlp cookies (mode 0600, owned by `transcript`)
+└── storage/jobs/…                        per-job output directories
+```
+
+### One-time bootstrap (already done on the production VPS)
+
+1. Install build deps (`build-essential` already present) and rustup user-local
+   for `root` (`curl https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal`).
+2. `git clone git@github.com:shergutt/youtube_knowledge.git /opt/transcript-backend/src`
+3. `cd /opt/transcript-backend/src/backend && cargo build --release`
+4. Copy the binary to `/opt/transcript-backend/target/release/transcript-backend-<version>`
+5. Symlink `transcript-backend.current` to it
+6. Drop the `override.conf` in place and `systemctl daemon-reload`
+7. `systemctl restart transcript-backend.service`; verify `/health` returns `{"status":"ok"}`
+
+### Rolling out a new change
+
+On the dev machine:
+
+```bash
+git add -A
+git commit -m "feat: …"
+git push origin master
+```
+
+On the VPS:
+
+```bash
+/opt/transcript-backend/deploy.sh
+```
+
+Internally the script:
+
+1. `git fetch --tags --prune` in `/opt/transcript-backend/src`
+2. `cargo build --release --bin transcript-backend`
+3. Copies the new binary to `target/release/transcript-backend-<git describe>`
+4. Updates the `current` symlink atomically
+5. `systemctl restart transcript-backend.service`
+6. Polls `/health` for up to 10 seconds; on failure, restores the previous
+   binary's symlink and restarts
+7. Garbage-collects everything except the last 5 release binaries and the one
+   currently pointed to by `current`
+
+To deploy a specific ref (tag, branch, or SHA) instead of `master` HEAD:
+
+```bash
+/opt/transcript-backend/deploy.sh v0.1.2
+```
+
+### Emergency back-out
+
+The old binary at `/usr/local/bin/transcript-backend` is preserved for one
+release as a safety net. To revert to it:
+
+```bash
+sudo rm /etc/systemd/system/transcript-backend.service.d/override.conf
+sudo systemctl daemon-reload
+sudo systemctl restart transcript-backend.service
+```
+
+## Deploying frontend changes
+
+The frontend is hosted on Vercel and connected to this GitHub repo, so every
+push to `master` is auto-deployed. PR branches get preview URLs.
+
+To set this up on a fresh project:
+
+1. Go to <https://vercel.com/new> and import `shergutt/youtube_knowledge`
+2. Set the **Root Directory** to `frontend`
+3. Framework preset: **Vite**
+4. Add env var `VITE_API_BASE` (e.g. `https://yt-api.valorix.lat`)
+5. Deploy
+
+After that, every push to `master` deploys to the production URL and every PR
+gets a preview. Manual `vercel --prod` is no longer needed.
