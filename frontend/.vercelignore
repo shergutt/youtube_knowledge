@@ -1,0 +1,16 @@
+# Build artifacts
+dist
+node_modules
+
+# Vite cache
+.vite
+
+# Local env
+.env
+.env.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store

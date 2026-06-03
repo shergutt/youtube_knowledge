@@ -1,0 +1,55 @@
+# Rust
+backend/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / Vite
+frontend/dist/
+frontend/node_modules/
+frontend/.vercel/
+frontend/tsconfig.tsbuildinfo
+**/.vite/
+**/*.tsbuildinfo
+
+# Local runtime
+storage/
+**/storage/
+cookies.txt
+*.cookies
+*.cookies.txt
+
+# Env / secrets — keep .env.example
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+**/secrets/
+**/*.pem
+**/*.key
+**/cert.pem
+**/credentials*.json
+
+# Backups / artifacts
+*.bak
+*.bak.*
+*.old
+*.tmp
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# OS / editor
+.idea/
+.vscode/
+*.iml
+
+# yt-dlp cache
+.cache/
+**/.yt-dlp-cache/
+
+# Build outputs by hand
+**/transcript-backend
+**/transcript-backend.new
+**/transcript-backend.bak

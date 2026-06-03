@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: transcript-backend
+    restart: unless-stopped
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8080"
+      STORAGE_DIR: "/app/storage"
+      MAX_CONCURRENT_JOBS: "2"
+      JOB_TIMEOUT_SECONDS: "120"
+      FILE_TTL_MINUTES: "60"
+      MAX_URL_LENGTH: "2048"
+      MAX_TRANSCRIPT_FILE_MB: "25"
+      CORS_ORIGIN: "http://localhost:3000"
+      ANALYSIS_TIMEOUT_SECONDS: "1200"
+      ANALYSIS_MAX_OUTPUT_TOKENS: "16384"
+      ANALYSIS_TEMPERATURE: "1.0"
+      ANALYSIS_TOP_P: "0.95"
+    volumes:
+      - transcript_storage:/app/storage
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: transcript-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  transcript_storage:
