@@ -168,12 +168,26 @@ On the dev machine:
 git add -A
 git commit -m "feat: …"
 git push origin master
+# (frontend is auto-deployed by Vercel at this point)
 ```
 
-On the VPS:
+Deploy the backend to the VPS (run from this repo on the dev machine):
 
 ```bash
-/opt/transcript-backend/deploy.sh
+scripts/deploy-backend.sh
+```
+
+That script is **not in the repo** (it is gitignored under `scripts/deploy-*.sh`)
+and lives only on your dev machine. It SSHes into the VPS as `root` using your
+local SSH key (one-time setup: `ssh-copy-id root@185.245.183.179`) and runs
+`/opt/transcript-backend/deploy.sh` on the VPS.
+
+It accepts an optional ref argument and supports a dry-run:
+
+```bash
+scripts/deploy-backend.sh v0.1.2         # deploy a specific tag/branch/SHA
+scripts/deploy-backend.sh --dry-run      # print the ssh command, don't run it
+scripts/deploy-backend.sh --logs         # tail the journal after the deploy
 ```
 
 Internally the script:

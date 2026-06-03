@@ -53,3 +53,11 @@ Thumbs.db
 **/transcript-backend
 **/transcript-backend.new
 **/transcript-backend.bak
+
+# Operational scripts that should never be in a public repo:
+#   - deploy triggers (would point at a private VPS)
+#   - anything else that bakes credentials or hostnames
+scripts/deploy-*.sh
+scripts/*.local.sh
+**/deploy.local.*
+**/.deployrc
