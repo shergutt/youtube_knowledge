@@ -27,6 +27,10 @@ pub fn build_router(state: AppState, max_body_bytes: usize) -> Router {
             "/api/analyses/{id}/download",
             get(analyses::download_analysis),
         )
+        .route(
+            "/api/jobs/{job_id}/analyses/download",
+            get(analyses::download_analyses_zip),
+        )
         .route("/api/playlists/probe", post(playlists::probe))
         .route("/api/playlists", post(playlists::create_playlist))
         .route("/api/playlists/{id}", get(playlists::get_playlist))

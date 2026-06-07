@@ -560,3 +560,129 @@ fn is_markdown(p: &Path) -> bool {
         .map(|e| e.eq_ignore_ascii_case("md"))
         .unwrap_or(false)
 }
+
+/// `GET /api/jobs/{job_id}/analyses/download` — streams every completed
+/// analysis for a transcript job as a single zip. The zip shares the same
+/// per-byte cap as the playlist zip (`max_playlist_zip_mb`) since both
+/// features are conceptually "many files bundled into one archive".
+pub async fn download_analyses_zip(
+    State(state): State<AppState>,
+    AxPath(job_id): AxPath<Uuid>,
+) -> AppResult<Response> {
+    // Source job must exist and not be expired.
+    let source_expires_at = {
+        let jobs = state.jobs.read().await;
+        jobs.get(&job_id).map(|j| j.expires_at)
+    };
+    if source_expires_at.is_none() {
+        return Err(AppError::JobNotFound);
+    }
+    if is_expired(source_expires_at.flatten()) {
+        return Err(AppError::FileExpired);
+    }
+
+    // Collect every completed analysis for this source job. Snapshots
+    // (clone) so we can drop the read guard before doing file I/O.
+    let analyses: Vec<AnalysisJob> = {
+        let map = state.analyses.read().await;
+        map.values()
+            .filter(|a| a.source_job_id == job_id)
+            .filter(|a| a.status == AnalysisStatus::Completed)
+            .filter(|a| a.output_filename.is_some())
+            .cloned()
+            .collect()
+    };
+    if analyses.is_empty() {
+        return Err(AppError::InvalidAnalysisRequest(
+            "no completed analyses to download".to_string(),
+        ));
+    }
+
+    let max_bytes = state.config.max_playlist_zip_mb * 1024 * 1024;
+    let cursor = std::io::Cursor::new(Vec::<u8>::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+
+    let mut written: usize = 0;
+    let mut added: usize = 0;
+    for a in &analyses {
+        let Some(filename) = a.output_filename.as_deref() else {
+            continue;
+        };
+        let path = Path::new(&a.job_dir).join(filename);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        written += bytes.len();
+        if written > max_bytes as usize {
+            return Err(AppError::Internal(format!(
+                "analyses zip exceeds {} MB",
+                state.config.max_playlist_zip_mb
+            )));
+        }
+        let slug = crate::services::analyzer::purpose_slug(a.purpose);
+        let arc = format!("{:03}-{}.{}.md", added, sanitize_zip(&a.title), slug);
+        zip.start_file(&arc, options)
+            .map_err(|e| AppError::Internal(format!("zip: {}", e)))?;
+        use std::io::Write;
+        zip.write_all(&bytes)
+            .map_err(|e| AppError::Internal(format!("zip write: {}", e)))?;
+        added += 1;
+    }
+
+    if added == 0 {
+        return Err(AppError::InvalidAnalysisRequest(
+            "no completed analyses to download".to_string(),
+        ));
+    }
+
+    let cursor = zip
+        .finish()
+        .map_err(|e| AppError::Internal(format!("zip finish: {}", e)))?;
+    let bytes = cursor.into_inner();
+
+    let download_name = format!("analyses-{}.zip", &job_id.to_string()[..8]);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        download_name.replace('"', "_")
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition).unwrap_or(HeaderValue::from_static("attachment")),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from(bytes.len() as u64),
+    );
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from(bytes))
+        .expect("response builder");
+    let mut response = response;
+    response.headers_mut().extend(headers);
+    Ok(response)
+}
+
+fn sanitize_zip(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => out.push('_'),
+            c if c.is_control() => out.push('_'),
+            c => out.push(c),
+        }
+        if out.len() >= 80 {
+            break;
+        }
+    }
+    out.trim().to_string()
+}

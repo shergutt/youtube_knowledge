@@ -351,6 +351,19 @@ export function SinglePage({ health }: { health: HealthResponse | null }) {
                 </button>
               ))}
             </div>
+            {(() => {
+              const completed = analyses.filter((a) => a.status === "completed");
+              if (completed.length < 1 || !job) return null;
+              return (
+                <DownloadButton
+                  href={absoluteUrl(
+                    `/api/jobs/${job.job_id}/analyses/download`,
+                  )}
+                  filename={`analyses-${job.job_id.slice(0, 8)}.zip`}
+                  label={`Download all (${completed.length} as zip)`}
+                />
+              );
+            })()}
           </div>
           {activeAnalysis &&
             activeAnalysis.status === "completed" &&
