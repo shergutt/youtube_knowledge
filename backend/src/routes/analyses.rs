@@ -15,21 +15,37 @@ use crate::app_state::AppState;
 use crate::errors::{AppError, AppResult};
 use crate::models::analysis::{AnalysisJob, AnalysisPurpose, AnalysisStatus};
 use crate::models::job::{JobError, JobStatus};
+use crate::models::playlist::AnalysisSpec;
 use crate::utils::time::is_expired;
+
+/// Maximum number of analysis specs accepted per request. Mirrors the
+/// number of `AnalysisPurpose` variants, which is the natural upper bound
+/// (a request asking for the same purpose twice would just duplicate work).
+pub const MAX_ANALYSIS_SPECS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAnalysisRequest {
     pub job_id: Uuid,
-    pub purpose: AnalysisPurpose,
-    #[serde(default)]
-    pub custom_prompt: Option<String>,
+    /// One or more analysis goals. Each spec is queued and run in parallel
+    /// against the same transcript. The same `purpose` may be requested more
+    /// than once (e.g. summary in two languages), but duplicates are not
+    /// deduplicated server-side.
+    pub specs: Vec<AnalysisSpec>,
+    /// Optional override of the output language applied to every spec in
+    /// `specs` whose `output_language` is empty. Useful so the frontend can
+    /// keep a single "output language" field across a multi-goal request.
     #[serde(default)]
     pub output_language: Option<String>,
+    /// Optional override of the custom prompt applied to every spec in
+    /// `specs` whose `purpose` is `custom` and whose own `custom_prompt` is
+    /// empty. Only used when at least one spec asks for the custom goal.
+    #[serde(default)]
+    pub custom_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateAnalysisResponse {
-    pub analysis_id: Uuid,
+    pub analysis_ids: Vec<Uuid>,
     pub status: AnalysisStatus,
 }
 
@@ -40,34 +56,101 @@ pub async fn create_analysis(
     if state.analyzer.is_none() {
         return Err(AppError::AnalysisNotConfigured);
     }
-    if matches!(req.purpose, AnalysisPurpose::Custom) {
-        let prompt = req.custom_prompt.as_deref().unwrap_or("").trim();
-        if prompt.is_empty() {
-            return Err(AppError::InvalidAnalysisRequest(
-                "custom_prompt is required when purpose=custom".to_string(),
-            ));
-        }
-        if prompt.len() > 2000 {
-            return Err(AppError::InvalidAnalysisRequest(
-                "custom_prompt must be <= 2000 characters".to_string(),
-            ));
-        }
+    if req.specs.is_empty() {
+        return Err(AppError::InvalidAnalysisRequest(
+            "at least one analysis spec is required".to_string(),
+        ));
     }
-    let output_language = req
+    if req.specs.len() > MAX_ANALYSIS_SPECS {
+        return Err(AppError::InvalidAnalysisRequest(format!(
+            "at most {} analysis specs per request",
+            MAX_ANALYSIS_SPECS
+        )));
+    }
+
+    let default_language = req
         .output_language
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("en")
         .to_string();
-    if output_language.len() > 16
-        || !output_language
+    if default_language.len() > 16
+        || !default_language
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return Err(AppError::InvalidAnalysisRequest(
             "output_language must be alphanumeric".to_string(),
         ));
+    }
+
+    // Normalize each spec: fill in default language, resolve custom_prompt.
+    let mut normalized: Vec<AnalysisSpec> = Vec::with_capacity(req.specs.len());
+    for (i, spec) in req.specs.into_iter().enumerate() {
+        if matches!(spec.purpose, AnalysisPurpose::Custom) {
+            let prompt = spec
+                .custom_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    req.custom_prompt
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_default();
+            if prompt.is_empty() {
+                return Err(AppError::InvalidAnalysisRequest(format!(
+                    "custom_prompt is required for spec #{} (purpose=custom)",
+                    i + 1
+                )));
+            }
+            if prompt.len() > 2000 {
+                return Err(AppError::InvalidAnalysisRequest(format!(
+                    "custom_prompt for spec #{} must be <= 2000 characters",
+                    i + 1
+                )));
+            }
+        }
+        let lang = if spec.output_language.trim().is_empty() {
+            default_language.clone()
+        } else {
+            spec.output_language.trim().to_string()
+        };
+        if lang.len() > 16
+            || !lang
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(AppError::InvalidAnalysisRequest(format!(
+                "output_language for spec #{} must be alphanumeric",
+                i + 1
+            )));
+        }
+        let resolved_prompt: Option<String> = if matches!(spec.purpose, AnalysisPurpose::Custom)
+        {
+            spec.custom_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    req.custom_prompt
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+        } else {
+            None
+        };
+        normalized.push(AnalysisSpec {
+            purpose: spec.purpose,
+            custom_prompt: resolved_prompt,
+            output_language: lang,
+        });
     }
 
     // Look up source job
@@ -101,33 +184,43 @@ pub async fn create_analysis(
 
     // Sub-directory inside the transcript job dir, so cleanup deletes both.
     let analysis_dir_rel = format!("{}/analysis", source_dir);
-    let job = AnalysisJob::new(
-        req.job_id,
-        video_id,
-        title,
-        language,
-        req.purpose,
-        if matches!(req.purpose, AnalysisPurpose::Custom) {
-            req.custom_prompt
-        } else {
-            None
-        },
-        output_language,
-        analysis_dir_rel,
-        state.config.minimax_model.clone(),
-        state.config.file_ttl_minutes,
-    );
-    let analysis_id = job.id;
 
+    // Build and register one AnalysisJob per spec, then spawn them all. The
+    // analysis semaphore inside `spawn_analysis` will throttle the actual
+    // MiniMax calls, but the registration + queuing step is parallel.
+    let mut analysis_ids: Vec<Uuid> = Vec::with_capacity(normalized.len());
     {
         let mut map = state.analyses.write().await;
-        map.insert(analysis_id, job);
+        for spec in normalized {
+            let custom_prompt = if matches!(spec.purpose, AnalysisPurpose::Custom) {
+                spec.custom_prompt
+            } else {
+                None
+            };
+            let job = AnalysisJob::new(
+                req.job_id,
+                video_id.clone(),
+                title.clone(),
+                language.clone(),
+                spec.purpose,
+                custom_prompt,
+                spec.output_language,
+                analysis_dir_rel.clone(),
+                state.config.minimax_model.clone(),
+                state.config.file_ttl_minutes,
+            );
+            let id = job.id;
+            map.insert(id, job);
+            analysis_ids.push(id);
+        }
     }
 
-    spawn_analysis(state.clone(), analysis_id);
+    for id in &analysis_ids {
+        spawn_analysis(state.clone(), *id);
+    }
 
     Ok(Json(CreateAnalysisResponse {
-        analysis_id,
+        analysis_ids,
         status: AnalysisStatus::Queued,
     }))
 }

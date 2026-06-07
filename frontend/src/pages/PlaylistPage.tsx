@@ -35,6 +35,35 @@ const PURPOSES: { value: AnalysisPurpose; label: string }[] = [
   { value: "custom", label: "Custom" },
 ];
 
+const PURPOSE_LABEL: Record<string, string> = PURPOSES.reduce(
+  (acc, p) => {
+    acc[p.value] = p.label;
+    return acc;
+  },
+  {} as Record<string, string>,
+);
+
+function abbreviatePurpose(p: AnalysisPurpose): string {
+  switch (p) {
+    case "summary":
+      return "S";
+    case "study_notes":
+      return "N";
+    case "key_takeaways":
+      return "K";
+    case "action_items":
+      return "A";
+    case "blog_post":
+      return "B";
+    case "tutorial":
+      return "T";
+    case "custom":
+      return "C";
+    default:
+      return "M";
+  }
+}
+
 export function PlaylistPage({ health }: { health: HealthResponse | null }) {
   const [url, setUrl] = useState("");
   const [probe, setProbe] = useState<PlaylistProbeResponse | null>(null);
@@ -45,7 +74,9 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
   const [source, setSource] = useState<CaptionSource>("auto");
   const [format, setFormat] = useState<OutputFormat>("txt");
   const [enableAnalysis, setEnableAnalysis] = useState(true);
-  const [purpose, setPurpose] = useState<AnalysisPurpose>("summary");
+  const [purposes, setPurposes] = useState<Set<AnalysisPurpose>>(
+    () => new Set<AnalysisPurpose>(["summary"]),
+  );
   const [outputLanguage, setOutputLanguage] = useState("en");
   const [customPrompt, setCustomPrompt] = useState("");
 
@@ -81,6 +112,15 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
     }
   }, [url]);
 
+  const togglePurpose = useCallback((p: AnalysisPurpose) => {
+    setPurposes((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) next.delete(p);
+      else next.add(p);
+      return next;
+    });
+  }, []);
+
   const handleProcess = useCallback(async () => {
     if (!probe) return;
     setError(null);
@@ -89,19 +129,21 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
     pollAbort.current?.abort();
     const ctrl = new AbortController();
     pollAbort.current = ctrl;
+    const orderedPurposes = PURPOSES.filter((p) => purposes.has(p.value)).map(
+      (p) => p.value,
+    );
+    const analysisSpecs = orderedPurposes.map((p) => ({
+      purpose: p,
+      custom_prompt: p === "custom" ? customPrompt : undefined,
+      output_language: outputLanguage,
+    }));
     try {
       const created = await playlistsApi.create({
         url,
         language,
         caption_source: source,
         output_format: format,
-        analysis: enableAnalysis
-          ? {
-              purpose,
-              custom_prompt: purpose === "custom" ? customPrompt : undefined,
-              output_language: outputLanguage,
-            }
-          : undefined,
+        analysis: enableAnalysis && analysisSpecs.length > 0 ? analysisSpecs : undefined,
       });
       const final = await pollPlaylist(
         created.playlist_id,
@@ -124,18 +166,20 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
             expires_at: final.expires_at,
           };
           recordTranscript(he);
-          if (c.analysis_id && c.analysis_filename) {
-            recordAnalysis({
-              job_id: c.transcript_job_id,
-              analysis: {
-                analysis_id: c.analysis_id,
-                purpose,
-                output_language: outputLanguage,
-                output_filename: c.analysis_filename,
-                created_at: new Date().toISOString(),
-                expires_at: final.expires_at,
-              },
-            });
+          for (const a of c.analyses) {
+            if (a.status === "completed" && a.filename) {
+              recordAnalysis({
+                job_id: c.transcript_job_id,
+                analysis: {
+                  analysis_id: a.analysis_id,
+                  purpose: a.purpose,
+                  output_language: a.output_language,
+                  output_filename: a.filename,
+                  created_at: new Date().toISOString(),
+                  expires_at: final.expires_at,
+                },
+              });
+            }
           }
         }
       }
@@ -156,7 +200,7 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
     source,
     format,
     enableAnalysis,
-    purpose,
+    purposes,
     outputLanguage,
     customPrompt,
   ]);
@@ -164,10 +208,12 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
   const canProcess = useMemo(() => {
     if (!probe || generating) return false;
     if (language.length === 0) return false;
-    if (enableAnalysis && purpose === "custom" && customPrompt.trim().length === 0)
-      return false;
+    if (enableAnalysis) {
+      if (purposes.size === 0) return false;
+      if (purposes.has("custom") && customPrompt.trim().length === 0) return false;
+    }
     return true;
-  }, [probe, generating, language, enableAnalysis, purpose, customPrompt]);
+  }, [probe, generating, language, enableAnalysis, purposes, customPrompt]);
 
   return (
     <main>
@@ -230,22 +276,36 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
             </label>
             {enableAnalysis && (
               <>
-                <label>
-                  <span>Analysis purpose</span>
-                  <select
-                    value={purpose}
-                    onChange={(e) =>
-                      setPurpose(e.target.value as AnalysisPurpose)
-                    }
-                    disabled={generating || (health?.analyzer ?? false) === false}
-                  >
-                    {PURPOSES.map((p) => (
-                      <option key={p.value} value={p.value}>
-                        {p.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <fieldset
+                  className="analysis-purpose"
+                  disabled={
+                    generating || (health?.analyzer ?? false) === false
+                  }
+                >
+                  <legend>Goals (multi-select)</legend>
+                  {PURPOSES.map((p) => {
+                    const isSelected = purposes.has(p.value);
+                    return (
+                      <label
+                        key={p.value}
+                        className={isSelected ? "selected" : undefined}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => togglePurpose(p.value)}
+                        />
+                        <span className="label">{p.label}</span>
+                      </label>
+                    );
+                  })}
+                </fieldset>
+                {purposes.size > 1 && (
+                  <p className="hint">
+                    {purposes.size} analyses will run in parallel on each
+                    video.
+                  </p>
+                )}
                 <label>
                   <span>Output language</span>
                   <input
@@ -259,7 +319,7 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
                     maxLength={16}
                   />
                 </label>
-                {purpose === "custom" && (
+                {purposes.has("custom") && (
                   <label>
                     <span>Custom prompt</span>
                     <textarea
@@ -374,16 +434,32 @@ export function PlaylistPage({ health }: { health: HealthResponse | null }) {
                       T
                     </a>
                   )}
-                  {c.analysis_download_url && c.analysis_filename && (
-                    <a
-                      className="ghost small"
-                      href={absoluteUrl(c.analysis_download_url)}
-                      download={c.analysis_filename}
-                      title={c.analysis_filename}
-                    >
-                      M
-                    </a>
-                  )}
+                  {c.analyses.map((a) => {
+                    const label = `${PURPOSE_LABEL[a.purpose] ?? a.purpose}`;
+                    if (a.status === "completed" && a.download_url) {
+                      return (
+                        <a
+                          key={a.analysis_id}
+                          className="ghost small"
+                          href={absoluteUrl(a.download_url)}
+                          download={a.filename ?? a.analysis_id}
+                          title={`${label} (${a.output_language})${a.filename ? ` · ${a.filename}` : ""}`}
+                        >
+                          {abbreviatePurpose(a.purpose)}
+                        </a>
+                      );
+                    }
+                    return (
+                      <span
+                        key={a.analysis_id}
+                        className="ghost small"
+                        title={`${label} (${a.output_language}) — ${a.status}${a.error ? `: ${a.error.message}` : ""}`}
+                        aria-disabled="true"
+                      >
+                        {abbreviatePurpose(a.purpose)}·
+                      </span>
+                    );
+                  })}
                 </div>
               </li>
             ))}

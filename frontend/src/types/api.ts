@@ -71,13 +71,19 @@ export interface AnalysisSpec {
 
 export interface CreateAnalysisRequest {
   job_id: string;
-  purpose: AnalysisPurpose;
-  custom_prompt?: string;
+  /** One or more analysis goals. Each spec is queued and run in parallel
+   *  against the same transcript. */
+  specs: AnalysisSpec[];
+  /** Optional default output language applied to specs whose own
+   *  `output_language` is empty. */
   output_language?: string;
+  /** Optional default custom prompt applied to specs whose purpose is
+   *  `custom` and whose own `custom_prompt` is empty. */
+  custom_prompt?: string;
 }
 
 export interface CreateAnalysisResponse {
-  analysis_id: string;
+  analysis_ids: string[];
   status: AnalysisStatus;
 }
 
@@ -138,7 +144,7 @@ export interface CreatePlaylistRequest {
   language: string;
   caption_source: CaptionSource;
   output_format: OutputFormat;
-  analysis?: AnalysisSpec;
+  analysis?: AnalysisSpec[];
 }
 
 export interface CreatePlaylistResponse {
@@ -153,6 +159,16 @@ export type PlaylistChildStage =
   | "failed"
   | "skipped";
 
+export interface ChildAnalysis {
+  analysis_id: string;
+  purpose: AnalysisPurpose;
+  output_language: string;
+  filename?: string;
+  download_url?: string;
+  status: string;
+  error?: { code: string; message: string };
+}
+
 export interface PlaylistChild {
   video_id: string;
   title: string;
@@ -160,9 +176,8 @@ export interface PlaylistChild {
   transcript_job_id?: string;
   transcript_filename?: string;
   transcript_download_url?: string;
-  analysis_id?: string;
-  analysis_filename?: string;
-  analysis_download_url?: string;
+  /** One entry per analysis spec that ran against this child's transcript. */
+  analyses: ChildAnalysis[];
   error?: { code: string; message: string };
 }
 
@@ -173,7 +188,7 @@ export interface PlaylistResponse {
   language: string;
   caption_source: CaptionSource;
   output_format: OutputFormat;
-  analysis?: AnalysisSpec;
+  analysis?: AnalysisSpec[];
   status: "queued" | "running" | "completed" | "failed" | "expired";
   total: number;
   completed: number;

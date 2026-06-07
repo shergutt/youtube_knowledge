@@ -19,10 +19,12 @@ use crate::models::analysis::{AnalysisJob, AnalysisPurpose, AnalysisStatus};
 use crate::models::api::{CaptionSource, OutputFormat};
 use crate::models::job::{JobError, JobStatus, TranscriptJob};
 use crate::models::playlist::{
-    AnalysisSpec, ChildStage, PlaylistChild, PlaylistJob, PlaylistStatus,
+    AnalysisSpec, ChildAnalysis, ChildStage, PlaylistChild, PlaylistJob, PlaylistStatus,
 };
 use crate::services::youtube_url::extract_playlist_id;
 use crate::utils::time::is_expired;
+
+use super::analyses::MAX_ANALYSIS_SPECS;
 
 #[derive(Debug, Deserialize)]
 pub struct ProbeRequest {
@@ -83,8 +85,10 @@ pub struct CreatePlaylistRequest {
     pub language: String,
     pub caption_source: CaptionSource,
     pub output_format: OutputFormat,
+    /// One or more analysis specs to run on every video of the playlist.
+    /// `None` means "transcripts only, no analysis".
     #[serde(default)]
-    pub analysis: Option<AnalysisSpec>,
+    pub analysis: Option<Vec<AnalysisSpec>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,29 +123,45 @@ pub async fn create_playlist(
             "language contains invalid characters".to_string(),
         ));
     }
-    if let Some(spec) = &req.analysis {
-        if matches!(spec.purpose, AnalysisPurpose::Custom) {
-            let prompt = spec.custom_prompt.as_deref().unwrap_or("").trim();
-            if prompt.is_empty() {
-                return Err(AppError::InvalidAnalysisRequest(
-                    "custom_prompt is required when purpose=custom".to_string(),
-                ));
-            }
-            if prompt.len() > 2000 {
-                return Err(AppError::InvalidAnalysisRequest(
-                    "custom_prompt must be <= 2000 characters".to_string(),
-                ));
-            }
-        }
-        if spec.output_language.len() > 16
-            || !spec
-                .output_language
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+    if let Some(specs) = &req.analysis {
+        if specs.is_empty() {
             return Err(AppError::InvalidAnalysisRequest(
-                "analysis.output_language must be alphanumeric".to_string(),
+                "analysis must be a non-empty list of specs".to_string(),
             ));
+        }
+        if specs.len() > MAX_ANALYSIS_SPECS {
+            return Err(AppError::InvalidAnalysisRequest(format!(
+                "at most {} analysis specs per playlist",
+                MAX_ANALYSIS_SPECS
+            )));
+        }
+        for (i, spec) in specs.iter().enumerate() {
+            if matches!(spec.purpose, AnalysisPurpose::Custom) {
+                let prompt = spec.custom_prompt.as_deref().unwrap_or("").trim();
+                if prompt.is_empty() {
+                    return Err(AppError::InvalidAnalysisRequest(format!(
+                        "custom_prompt is required for spec #{} (purpose=custom)",
+                        i + 1
+                    )));
+                }
+                if prompt.len() > 2000 {
+                    return Err(AppError::InvalidAnalysisRequest(format!(
+                        "custom_prompt for spec #{} must be <= 2000 characters",
+                        i + 1
+                    )));
+                }
+            }
+            if spec.output_language.len() > 16
+                || !spec
+                    .output_language
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(AppError::InvalidAnalysisRequest(format!(
+                    "output_language for spec #{} must be alphanumeric",
+                    i + 1
+                )));
+            }
         }
     }
     if state.analyzer.is_none() && req.analysis.is_some() {
@@ -238,9 +258,7 @@ fn spawn_playlist(state: AppState, playlist_id: Uuid) {
                         transcript_job_id: None,
                         transcript_filename: None,
                         transcript_download_url: None,
-                        analysis_id: None,
-                        analysis_filename: None,
-                        analysis_download_url: None,
+                        analyses: Vec::new(),
                         error: None,
                     })
                     .collect();
@@ -315,7 +333,7 @@ async fn process_one(
     language: &str,
     caption_source: CaptionSource,
     output_format: OutputFormat,
-    analysis: Option<&AnalysisSpec>,
+    analysis: Option<&Vec<AnalysisSpec>>,
 ) {
     let (video_id, title) = {
         let map = state.playlists.read().await;
@@ -394,57 +412,159 @@ async fn process_one(
         }
     }
 
-    // 2. Optionally create analysis.
-    if let Some(spec) = analysis {
-        let analysis_id = match create_child_analysis(
-            state,
-            transcript_job_id,
-            &video_id,
-            &title,
-            language,
-            spec,
-        )
-        .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(error = %e, video_id = %video_id, "analysis create failed");
-                mark_child_failed(state, playlist_id, child_index, e.code(), &e.message()).await;
-                return;
+    // 2. Optionally create analyses (one per spec, in parallel).
+    if let Some(specs) = analysis {
+        // Create all analysis jobs up front so we have ids to poll.
+        let mut per_spec: Vec<(AnalysisSpec, Uuid)> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match create_child_analysis(
+                state,
+                transcript_job_id,
+                &video_id,
+                &title,
+                language,
+                spec,
+            )
+            .await
+            {
+                Ok(id) => per_spec.push((spec.clone(), id)),
+                Err(e) => {
+                    warn!(error = %e, video_id = %video_id, "analysis create failed");
+                    // Don't abort the whole child; record the failure and
+                    // keep going for the remaining specs.
+                    per_spec.push((
+                        spec.clone(),
+                        Uuid::nil(), // sentinel: a nil id marks a creation failure
+                    ));
+                    let _ = e; // suppress unused warning if the warn! is stripped
+                }
             }
-        };
-        let analysis_final = match wait_for_analysis(state, analysis_id).await {
-            Ok(j) => j,
-            Err(e) => {
-                warn!(error = %e, video_id = %video_id, "analysis wait failed");
-                mark_child_failed(state, playlist_id, child_index, e.code(), &e.message()).await;
-                return;
-            }
-        };
-        if analysis_final.status != AnalysisStatus::Completed {
-            let code = analysis_final
-                .error
-                .as_ref()
-                .map(|e| e.code.clone())
-                .unwrap_or_else(|| "INTERNAL_ERROR".to_string());
-            let message = analysis_final
-                .error
-                .as_ref()
-                .map(|e| e.message.clone())
-                .unwrap_or_else(|| "analysis job failed".to_string());
-            mark_child_failed(state, playlist_id, child_index, &code, &message).await;
-            return;
         }
+
+        // Wait for each analysis in parallel. `wait_for_analysis` returns
+        // the final job record; we only abort the whole child on internal
+        // errors (e.g. timeout), per-spec failures are captured on the
+        // child record.
+        let mut joinset = tokio::task::JoinSet::new();
+        for (_, id) in &per_spec {
+            if id.is_nil() {
+                continue;
+            }
+            let state_c = state.clone();
+            let id_c = *id;
+            joinset.spawn(async move { (id_c, wait_for_analysis(&state_c, id_c).await) });
+        }
+        let mut results: std::collections::HashMap<Uuid, Result<AnalysisJob, AppError>> =
+            std::collections::HashMap::new();
+        while let Some(res) = joinset.join_next().await {
+            if let Ok((id, r)) = res {
+                results.insert(id, r);
+            }
+        }
+
+        let mut child_analyses: Vec<ChildAnalysis> = Vec::with_capacity(per_spec.len());
+        let mut hard_fail: Option<(String, String)> = None;
+        for (spec, id) in per_spec {
+            if id.is_nil() {
+                child_analyses.push(ChildAnalysis {
+                    analysis_id: Uuid::nil(),
+                    purpose: spec.purpose,
+                    output_language: spec.output_language.clone(),
+                    filename: None,
+                    download_url: None,
+                    status: "failed".to_string(),
+                    error: Some(JobError {
+                        code: "INTERNAL_ERROR".to_string(),
+                        message: "analysis could not be queued".to_string(),
+                    }),
+                });
+                continue;
+            }
+            match results.remove(&id) {
+                Some(Ok(job)) => {
+                    let (status, filename, download_url, error) = match job.status {
+                        AnalysisStatus::Completed => (
+                            "completed".to_string(),
+                            job.output_filename.clone(),
+                            Some(format!("/api/analyses/{}/download", id)),
+                            None,
+                        ),
+                        AnalysisStatus::Failed => {
+                            let err = job.error.clone().unwrap_or(JobError {
+                                code: "INTERNAL_ERROR".to_string(),
+                                message: "analysis failed".to_string(),
+                            });
+                            ("failed".to_string(), None, None, Some(err))
+                        }
+                        other => (
+                            format!("{:?}", other).to_lowercase(),
+                            None,
+                            None,
+                            job.error.clone(),
+                        ),
+                    };
+                    child_analyses.push(ChildAnalysis {
+                        analysis_id: id,
+                        purpose: spec.purpose,
+                        output_language: spec.output_language,
+                        filename,
+                        download_url,
+                        status,
+                        error,
+                    });
+                }
+                Some(Err(e)) => {
+                    warn!(error = %e, video_id = %video_id, analysis_id = %id, "analysis wait failed");
+                    // A wait-time error (timeout, internal) is hard — the
+                    // transcript is still on disk and other analyses may
+                    // have succeeded, so we record the per-spec error and
+                    // keep going. We only short-circuit on truly fatal
+                    // errors.
+                    if matches!(e, AppError::JobNotFound | AppError::MiniMaxTimeout) {
+                        hard_fail = Some((e.code().to_string(), e.message()));
+                    }
+                    child_analyses.push(ChildAnalysis {
+                        analysis_id: id,
+                        purpose: spec.purpose,
+                        output_language: spec.output_language,
+                        filename: None,
+                        download_url: None,
+                        status: "failed".to_string(),
+                        error: Some(JobError {
+                            code: e.code().to_string(),
+                            message: e.message(),
+                        }),
+                    });
+                }
+                None => {
+                    child_analyses.push(ChildAnalysis {
+                        analysis_id: id,
+                        purpose: spec.purpose,
+                        output_language: spec.output_language,
+                        filename: None,
+                        download_url: None,
+                        status: "failed".to_string(),
+                        error: Some(JobError {
+                            code: "INTERNAL_ERROR".to_string(),
+                            message: "analysis did not return".to_string(),
+                        }),
+                    });
+                }
+            }
+        }
+
         {
             let mut map = state.playlists.write().await;
             if let Some(p) = map.get_mut(&playlist_id) {
                 if let Some(c) = p.children.get_mut(child_index) {
-                    c.analysis_id = Some(analysis_id);
-                    c.analysis_filename = analysis_final.output_filename.clone();
-                    c.analysis_download_url =
-                        Some(format!("/api/analyses/{}/download", analysis_id));
+                    c.analyses = child_analyses;
                 }
             }
+        }
+
+        if let Some((code, message)) = hard_fail {
+            mark_child_failed(state, playlist_id, child_index, &code, &message).await;
+            return;
         }
     }
 
@@ -704,7 +824,7 @@ pub struct PlaylistResponse {
     pub language: String,
     pub caption_source: CaptionSource,
     pub output_format: OutputFormat,
-    pub analysis: Option<AnalysisSpec>,
+    pub analysis: Option<Vec<AnalysisSpec>>,
     pub status: PlaylistStatus,
     pub total: usize,
     pub completed: usize,
@@ -816,7 +936,14 @@ pub async fn download_zip(
                 }
             }
         }
-        if let (Some(aid), Some(name)) = (c.analysis_id, &c.analysis_filename) {
+        for a in &c.analyses {
+            if a.status != "completed" {
+                continue;
+            }
+            let (aid, name) = match (a.analysis_id, a.filename.as_deref()) {
+                (aid, Some(n)) if !aid.is_nil() => (aid, n),
+                _ => continue,
+            };
             let map = state.analyses.read().await;
             if let Some(aj) = map.get(&aid) {
                 let path = Path::new(&aj.job_dir).join(name);
@@ -828,7 +955,13 @@ pub async fn download_zip(
                             state.config.max_playlist_zip_mb
                         )));
                     }
-                    let arc = format!("analyses/{:03}-{}.md", added, sanitize_zip(&aj.title));
+                    let slug = crate::services::analyzer::purpose_slug(a.purpose);
+                    let arc = format!(
+                        "analyses/{:03}-{}.{}.md",
+                        added,
+                        sanitize_zip(&aj.title),
+                        slug
+                    );
                     zip.start_file(&arc, options)
                         .map_err(|e| AppError::Internal(format!("zip: {}", e)))?;
                     use std::io::Write;

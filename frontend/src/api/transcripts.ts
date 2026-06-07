@@ -85,3 +85,63 @@ export async function pollAnalysis(
   }
   throw new DOMException("aborted", "AbortError");
 }
+
+const TERMINAL = new Set(["completed", "failed", "expired"]);
+
+/**
+ * Poll many analyses concurrently. Returns a map of id -> final state once
+ * every analysis has reached a terminal status. The onTick callback fires
+ * after every individual status fetch and receives the full latest snapshot
+ * map, which the caller can use to drive per-row progress UI.
+ */
+export async function pollAnalyses(
+  ids: string[],
+  intervalMs: number,
+  signal: AbortSignal,
+  onTick: (snapshot: Record<string, AnalysisJobResponse>) => void,
+): Promise<Record<string, AnalysisJobResponse>> {
+  if (ids.length === 0) return {};
+  const latest: Record<string, AnalysisJobResponse> = {};
+  const pending = new Set(ids);
+  const tick = () => onTick({ ...latest });
+  while (pending.size > 0 && !signal.aborted) {
+    const responses = await Promise.all(
+      Array.from(pending).map(async (id) => {
+        try {
+          const s = await transcriptsApi.analysisStatus(id);
+          return [id, s] as const;
+        } catch (e) {
+          if ((e as Error).name === "AbortError") throw e;
+          return null;
+        }
+      }),
+    );
+    for (const r of responses) {
+      if (!r) continue;
+      const [id, s] = r;
+      latest[id] = s;
+      if (TERMINAL.has(s.status)) {
+        pending.delete(id);
+      }
+    }
+    tick();
+    if (pending.size > 0) {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, intervalMs);
+        signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            reject(new DOMException("aborted", "AbortError"));
+          },
+          { once: true },
+        );
+      });
+    }
+  }
+  if (signal.aborted) {
+    throw new DOMException("aborted", "AbortError");
+  }
+  tick();
+  return latest;
+}

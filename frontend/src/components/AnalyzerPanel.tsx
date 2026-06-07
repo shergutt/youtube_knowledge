@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { AnalysisPurpose } from "../types/api";
 import { ApiError } from "../api/client";
-import { pollAnalysis, transcriptsApi } from "../api/transcripts";
+import { pollAnalyses, transcriptsApi } from "../api/transcripts";
 import { showToast } from "./Toast";
 
 interface AnalyzerPanelProps {
@@ -11,6 +11,8 @@ interface AnalyzerPanelProps {
   transcriptLanguage: string;
   analyzerEnabled: boolean;
   onError: (msg: { message: string; code?: string }) => void;
+  /** Called with every freshly-completed analysis. Multiple calls can fire
+   *  in quick succession when several analyses finish in the same poll tick. */
   onComplete: (resp: import("../types/api").AnalysisJobResponse) => void;
 }
 
@@ -64,6 +66,16 @@ const QUICK_OUTPUT_LANGUAGES: { code: string; label: string; full: string }[] = 
   { code: "ja", label: "JA", full: "Japanese" },
 ];
 
+const PURPOSE_LABEL: Record<AnalysisPurpose, string> = PURPOSES.reduce(
+  (acc, p) => {
+    acc[p.value] = p.label;
+    return acc;
+  },
+  {} as Record<AnalysisPurpose, string>,
+);
+// Re-export so the parent (SinglePage) can read the same map if it wants.
+export { PURPOSE_LABEL };
+
 export function AnalyzerPanel({
   jobId,
   transcriptLanguage,
@@ -71,13 +83,15 @@ export function AnalyzerPanel({
   onError,
   onComplete,
 }: AnalyzerPanelProps) {
-  const [purpose, setPurpose] = useState<AnalysisPurpose>("summary");
+  const [selected, setSelected] = useState<Set<AnalysisPurpose>>(
+    () => new Set<AnalysisPurpose>(["summary"]),
+  );
   const [customPrompt, setCustomPrompt] = useState("");
   const [outputLanguage, setOutputLanguage] = useState("en");
   const [generating, setGenerating] = useState(false);
-  const [progress, setProgress] = useState<{ status: string; pct: number } | null>(
-    null,
-  );
+  const [progress, setProgress] = useState<
+    Record<AnalysisPurpose, { status: string; pct: number }>
+  >({} as Record<AnalysisPurpose, { status: string; pct: number }>);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -87,7 +101,9 @@ export function AnalyzerPanel({
   }, []);
 
   useEffect(() => {
-    setProgress(null);
+    setProgress(
+      {} as Record<AnalysisPurpose, { status: string; pct: number }>,
+    );
     setGenerating(false);
     abortRef.current?.abort();
   }, [jobId]);
@@ -98,16 +114,37 @@ export function AnalyzerPanel({
         <h3>AI analysis</h3>
         <p className="hint">
           The analyzer is not configured on the server. Set the
-          <code> MINIMAX_API_KEY </code> environment variable and restart the
+          <code> MINIMAX_API_KEY </code>environment variable and restart the
           backend to enable it.
         </p>
       </div>
     );
   }
 
+  function togglePurpose(p: AnalysisPurpose) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) next.delete(p);
+      else next.add(p);
+      return next;
+    });
+  }
+
   async function handleGenerate() {
     onError({ message: "" });
-    setProgress({ status: "queued", pct: 5 });
+    const purposes = PURPOSES.filter((p) => selected.has(p.value)).map(
+      (p) => p.value,
+    );
+    if (purposes.length === 0) return;
+    const specs = purposes.map((purpose) => ({
+      purpose,
+      output_language: outputLanguage,
+      custom_prompt: purpose === "custom" ? customPrompt : undefined,
+    }));
+    const initial: Record<AnalysisPurpose, { status: string; pct: number }> =
+      {} as Record<AnalysisPurpose, { status: string; pct: number }>;
+    for (const p of purposes) initial[p] = { status: "queued", pct: 5 };
+    setProgress(initial);
     setGenerating(true);
     abortRef.current?.abort();
     const ctrl = new AbortController();
@@ -115,21 +152,35 @@ export function AnalyzerPanel({
     try {
       const created = await transcriptsApi.analyze({
         job_id: jobId,
-        purpose,
-        custom_prompt: purpose === "custom" ? customPrompt : undefined,
+        specs,
         output_language: outputLanguage,
+        custom_prompt: customPrompt,
       });
-      const final = await pollAnalysis(
-        created.analysis_id,
+      const ids = created.analysis_ids;
+      const final = await pollAnalyses(
+        ids,
         1500,
         ctrl.signal,
-        (s) =>
-          setProgress({
-            status: s.status,
-            pct: s.progress ?? (s.status === "running" ? 25 : 100),
-          }),
+        (snapshot) => {
+          setProgress((prev) => {
+            const next = { ...prev };
+            for (let i = 0; i < ids.length; i++) {
+              const s = snapshot[ids[i]];
+              if (s) {
+                next[purposes[i]] = {
+                  status: s.status,
+                  pct: s.progress ?? (s.status === "running" ? 25 : 100),
+                };
+              }
+            }
+            return next;
+          });
+        },
       );
-      onComplete(final);
+      for (const id of ids) {
+        const r = final[id];
+        if (r) onComplete(r);
+      }
     } catch (e) {
       if ((e as Error).name === "AbortError") return;
       onError(toAppError(e));
@@ -139,36 +190,57 @@ export function AnalyzerPanel({
     }
   }
 
+  const needsCustomPrompt = selected.has("custom");
   const canGenerate =
     !generating &&
-    (purpose !== "custom" || customPrompt.trim().length > 0);
+    selected.size > 0 &&
+    (!needsCustomPrompt || customPrompt.trim().length > 0);
+
+  const selectedPurposes = useMemo(
+    () => PURPOSES.filter((p) => selected.has(p.value)),
+    [selected],
+  );
+
+  const progressValues = Object.values(progress);
+  const progressDone = progressValues.filter(
+    (p) => p.status === "completed" || p.status === "failed",
+  ).length;
+  const progressRunning = progressValues.filter(
+    (p) => p.status === "running" || p.status === "queued",
+  ).length;
+  const hasProgress = progressValues.length > 0;
 
   return (
     <div className="analyzer-panel">
       <h3>AI analysis (MiniMax-M3)</h3>
       <p className="hint">
-        Turn the transcript into a structured markdown document. Output
-        language defaults to <code>en</code> but you can ask for any language.
+        Pick one or more goals — each runs in parallel against the same
+        transcript. Output language defaults to <code>en</code> but you can
+        ask for any language.
       </p>
 
       <div className="analysis-purpose">
         <fieldset disabled={generating}>
-          <legend>Goal</legend>
-          {PURPOSES.map((p) => (
-            <label key={p.value}>
-              <input
-                type="radio"
-                name="analysis_purpose"
-                value={p.value}
-                checked={purpose === p.value}
-                onChange={() => setPurpose(p.value)}
-              />
-              <span className="label">{p.label}</span>
-              <span className="hint">{p.description}</span>
-            </label>
-          ))}
+          <legend>Goals (multi-select)</legend>
+          {PURPOSES.map((p) => {
+            const isSelected = selected.has(p.value);
+            return (
+              <label
+                key={p.value}
+                className={isSelected ? "selected" : undefined}
+              >
+                <input
+                  type="checkbox"
+                  checked={isSelected}
+                  onChange={() => togglePurpose(p.value)}
+                />
+                <span className="label">{p.label}</span>
+                <span className="hint">{p.description}</span>
+              </label>
+            );
+          })}
         </fieldset>
-        {purpose === "custom" && (
+        {needsCustomPrompt && (
           <textarea
             value={customPrompt}
             onChange={(e) => setCustomPrompt(e.target.value)}
@@ -229,12 +301,29 @@ export function AnalyzerPanel({
           onClick={handleGenerate}
           disabled={!canGenerate}
         >
-          {generating ? "Analyzing…" : "Generate analysis"}
+          {generating
+            ? `Analyzing ${progressDone}/${selectedPurposes.length}…`
+            : selectedPurposes.length > 1
+              ? `Generate ${selectedPurposes.length} analyses in parallel`
+              : "Generate analysis"}
         </button>
-        {generating && progress && (
-          <p className="muted small inline-progress">
-            {progress.status} · {progress.pct}%
-          </p>
+        {generating && hasProgress && (
+          <div className="analysis-progress-list">
+            {selectedPurposes.map((p) => {
+              const row = progress[p.value];
+              return (
+                <span key={p.value} className="muted small inline-progress">
+                  {p.label}
+                  {row ? `: ${row.status} · ${row.pct}%` : ""}
+                </span>
+              );
+            })}
+            {progressRunning > 0 && (
+              <p className="muted small">
+                {progressRunning} of {progressValues.length} still running
+              </p>
+            )}
+          </div>
         )}
       </div>
     </div>
