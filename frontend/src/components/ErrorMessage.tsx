@@ -5,7 +5,7 @@ interface ErrorMessageProps {
 }
 
 export function ErrorMessage({ error }: ErrorMessageProps) {
-  if (!error) return null;
+  if (!error || !error.message.trim()) return null;
   return (
     <div className="error-message" role="alert">
       <strong>Error</strong>

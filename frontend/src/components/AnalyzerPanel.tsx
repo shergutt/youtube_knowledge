@@ -10,7 +10,8 @@ interface AnalyzerPanelProps {
   title: string;
   transcriptLanguage: string;
   analyzerEnabled: boolean;
-  onError: (msg: { message: string; code?: string }) => void;
+  /** Show an error in the parent, or pass `null` to clear any prior one. */
+  onError: (msg: { message: string; code?: string } | null) => void;
   /** Called with every freshly-completed analysis. Multiple calls can fire
    *  in quick succession when several analyses finish in the same poll tick. */
   onComplete: (resp: import("../types/api").AnalysisJobResponse) => void;
@@ -131,7 +132,7 @@ export function AnalyzerPanel({
   }
 
   async function handleGenerate() {
-    onError({ message: "" });
+    onError(null);
     const purposes = PURPOSES.filter((p) => selected.has(p.value)).map(
       (p) => p.value,
     );
