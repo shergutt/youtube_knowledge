@@ -21,7 +21,7 @@ export default function App() {
     <div className="app">
       <NavBar />
       <p className="subtitle">
-        A whisper of a URL, and the words return as light.
+        A field guide to the words spoken on YouTube.
       </p>
       <Routes>
         <Route path="/" element={<SinglePage health={health} />} />
@@ -29,7 +29,7 @@ export default function App() {
       </Routes>
       <footer>
         <small>
-          spun from mist, yt-dlp, and MiniMax-M3 · not affiliated with YouTube
+          sketched with yt-dlp &amp; MiniMax-M3 · unofficial, unaffiliated
         </small>
       </footer>
       <ToastHost />
