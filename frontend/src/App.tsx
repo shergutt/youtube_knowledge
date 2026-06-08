@@ -21,8 +21,7 @@ export default function App() {
     <div className="app">
       <NavBar />
       <p className="subtitle">
-        Paste a YouTube URL, pick a caption track, and download the transcript —
-        or let the AI summarize it.
+        A whisper of a URL, and the words return as light.
       </p>
       <Routes>
         <Route path="/" element={<SinglePage health={health} />} />
@@ -30,8 +29,7 @@ export default function App() {
       </Routes>
       <footer>
         <small>
-          Powered by yt-dlp and MiniMax-M3. Unofficial, not affiliated with
-          YouTube.
+          spun from mist, yt-dlp, and MiniMax-M3 · not affiliated with YouTube
         </small>
       </footer>
       <ToastHost />

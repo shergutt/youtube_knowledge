@@ -5,7 +5,7 @@ export function NavBar() {
   return (
     <header className="app-header">
       <div className="brand">
-        <span className="logo" aria-hidden="true">▶</span>
+        <span className="logo" aria-hidden="true">✦</span>
         <h1>YT Transcripts</h1>
       </div>
       <nav className="primary-nav" aria-label="Primary">
